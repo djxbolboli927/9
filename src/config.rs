@@ -30,11 +30,23 @@ pub struct TradingConfig {
     pub min_amount_sol: f64,
     pub max_amount_sol: f64,
     pub step_sol: f64,
+    /// Minimum NET profit (lamports) AFTER subtracting the Jito tip and the
+    /// network fee. An opportunity is sent only when the lamports left for us
+    /// (output - input - network_fee - jito_tip) exceed this value.
     pub min_profit_lamports: u64,
+    /// Minimum GROSS profit (lamports) = output - input, evaluated in Stage 1
+    /// BEFORE any tip math. Opportunities whose gross edge is below this are
+    /// discarded immediately and never reach the Jito-tip calculation stage.
+    #[serde(default = "default_min_gross_profit")]
+    pub min_gross_profit_lamports: u64,
     /// Standard Solana transaction fee in lamports (5000 = one signature fee).
     #[allow(dead_code)]
     pub base_fee_lamports: u64,
     pub tokens_file: String,
+}
+
+fn default_min_gross_profit() -> u64 {
+    0
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -43,11 +55,16 @@ pub struct JitoConfig {
     pub urls: Vec<String>,
     pub uuid: String,
     pub trading_keypair: String,
-    #[allow(dead_code)]
+    /// Floor for the dynamic Jito tip (lamports). The tip is never lower than
+    /// this — Jito's minimum accepted tip. Also added on top of the percent
+    /// share: tip = tip_min_lamports + tip_profit_percent * net_before_tip.
     pub tip_min_lamports: u64,
-    #[allow(dead_code)]
+    /// Hard ceiling for the dynamic Jito tip (lamports). Manually tuned cap so
+    /// a very large opportunity never over-tips beyond what we choose to pay.
     pub tip_max_lamports: u64,
-    #[allow(dead_code)]
+    /// Share of the net profit (output - input - network_fee) paid to Jito as
+    /// the tip, e.g. 0.70 = 70%. The remaining share stays with us and is what
+    /// gets compared against trading.min_profit_lamports.
     pub tip_profit_percent: f64,
     pub max_bundles_per_second: u32,
 }

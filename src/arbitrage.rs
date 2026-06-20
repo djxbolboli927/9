@@ -23,10 +23,60 @@ use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
-const JITO_TIP_LAMPORTS: u64 = 1_600;
 const NETWORK_FEE_LAMPORTS: u64 = 5_000;
 
 const RATE_RETRY_BACKOFF_MS: u64 = 20;
+
+// ─── Profit / tip parameters ───────────────────────────────────────────────────
+
+/// Per-scan, Copy-able snapshot of the trading/jito knobs used to gate
+/// opportunities and size the dynamic Jito tip. Built once per scan cycle from
+/// `Config` and captured by value inside the quote stream closure.
+#[derive(Clone, Copy)]
+struct ProfitParams {
+    /// Stage 1 gate: minimum gross edge (output - input) in lamports.
+    min_gross_profit: u64,
+    /// Stage 2 gate: minimum lamports left for us after tip + network fee.
+    min_net_profit: u64,
+    /// Jito tip floor (lamports) and the additive base of the tip.
+    tip_min: u64,
+    /// Jito tip ceiling (lamports).
+    tip_max: u64,
+    /// Fraction of net profit paid to Jito (e.g. 0.70 = 70%).
+    tip_percent: f64,
+    /// Solana network fee (lamports) reserved before tip math.
+    network_fee: u64,
+}
+
+impl ProfitParams {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            min_gross_profit: config.trading.min_gross_profit_lamports,
+            min_net_profit: config.trading.min_profit_lamports,
+            tip_min: config.jito.tip_min_lamports,
+            tip_max: config.jito.tip_max_lamports,
+            tip_percent: config.jito.tip_profit_percent,
+            network_fee: NETWORK_FEE_LAMPORTS,
+        }
+    }
+}
+
+/// Compute the dynamic Jito tip and the lamports left for us.
+///
+///   net_before_tip = output - input - network_fee
+///   tip            = clamp(tip_min + tip_percent * net_before_tip,
+///                          tip_min, tip_max)
+///   remaining      = net_before_tip - tip
+///
+/// `remaining` is what we keep; it is compared against `min_net_profit` to
+/// decide whether the opportunity is worth sending.
+fn compute_tip(output: u64, input: u64, p: &ProfitParams) -> (u64, i64) {
+    let net_before_tip = output as i64 - input as i64 - p.network_fee as i64;
+    let pct_part = (p.tip_percent * net_before_tip as f64).round() as i64;
+    let tip = (p.tip_min as i64 + pct_part).clamp(p.tip_min as i64, p.tip_max as i64);
+    let remaining = net_before_tip - tip;
+    (tip as u64, remaining)
+}
 
 // ─── Route helpers ───────────────────────────────────────────────────────────
 
@@ -124,6 +174,12 @@ struct QuotePair {
     token_mint: String,
     amount: u64,
     output_wsol: u64,
+    /// Dynamic Jito tip (lamports) sized from this opportunity's profit.
+    jito_tip: u64,
+    /// On-chain minimum acceptable output = amount + jito_tip + network_fee.
+    /// Becomes the revert floor embedded in the merged quote.
+    on_chain_floor: u64,
+    /// Lamports left for us after the tip + network fee (the "net" profit).
     net_profit: i64,
     quote1: QuoteResponse,
     quote2: QuoteResponse,
@@ -138,6 +194,8 @@ struct QuotePair {
 struct ReadyInstruction {
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
+    /// Dynamic Jito tip (lamports) carried from Stage 1 into the tx builder.
+    tip_lamports: u64,
     arrived_at: Instant,
     waited_for_slot: bool,
 }
@@ -187,7 +245,7 @@ async fn quote_check(
     token_mint: &str,
     amount: u64,
     only_direct: bool,
-    min_profit_lamports: u64,
+    profit: ProfitParams,
     metrics: &Metrics,
     token_metrics: &TokenMetrics,
 ) -> Option<QuotePair> {
@@ -233,9 +291,11 @@ async fn quote_check(
         ts.route_ok.fetch_add(1, Ordering::Relaxed);
     }
 
-    // min_profit_lamports is GROSS profit at quote stage (before fees).
-    let stage1_threshold = amount.saturating_add(min_profit_lamports);
-    if output_wsol <= stage1_threshold {
+    // ── Stage 1: gross profit gate (output - input), before any tip math. ──
+    // Cheapest possible filter: anything below the configured gross edge is
+    // dropped here and never reaches the Jito-tip calculation.
+    let gross_profit = output_wsol as i64 - amount as i64;
+    if gross_profit < profit.min_gross_profit as i64 {
         if let Some(ts) = ts {
             ts.not_profitable.fetch_add(1, Ordering::Relaxed);
         }
@@ -260,6 +320,17 @@ async fn quote_check(
         return None;
     }
 
+    // ── Stage 2: dynamic Jito tip + NET profit gate. ──────────────────────
+    // Tip is sized from this opportunity's profit; what remains for us after
+    // the tip and the network fee must clear min_net_profit to be worth it.
+    let (jito_tip, net_profit) = compute_tip(output_wsol, amount, &profit);
+    if net_profit <= profit.min_net_profit as i64 {
+        if let Some(ts) = ts {
+            ts.not_profitable.fetch_add(1, Ordering::Relaxed);
+        }
+        return None;
+    }
+
     if let Some(ts) = ts {
         ts.profitable.fetch_add(1, Ordering::Relaxed);
     }
@@ -273,14 +344,21 @@ async fn quote_check(
 
     metrics.metis_resp_ok.fetch_add(1, Ordering::Relaxed);
 
+    // On-chain revert floor = the EXPENSES we must protect, nothing more:
+    //   floor = input + jito_tip + network_fee
+    // This is algebraically identical to (output_wsol - net_profit): we do NOT
+    // bake our profit into the floor. Jupiter uses positive slippage, so any
+    // output above this floor still lands and the extra stays with us — we only
+    // guard against losing money on the costs incurred.
     let on_chain_floor = amount
-        .saturating_add(JITO_TIP_LAMPORTS)
+        .saturating_add(jito_tip)
         .saturating_add(NETWORK_FEE_LAMPORTS);
-    let net_profit = output_wsol as i64 - on_chain_floor as i64;
     Some(QuotePair {
         token_mint: token_mint.to_string(),
         amount,
         output_wsol,
+        jito_tip,
+        on_chain_floor,
         net_profit,
         quote1,
         quote2,
@@ -352,13 +430,14 @@ pub fn spawn_workers(
                 let keypair = ctx_c.trading_keypair.clone();
                 let alt = ctx_c.alt_cache.clone();
                 let rpc = ctx_c.rpc_client.clone();
+                let tip_lamports = item.tip_lamports;
                 let swap_ixs = item.swap_ixs;
 
                 let tx = match tokio::task::spawn_blocking(move || {
                     transaction::build_arb_transaction(
                         &swap_ixs,
                         &keypair,
-                        JITO_TIP_LAMPORTS,
+                        tip_lamports,
                         cu_limit,
                         recent_blockhash,
                         &alt,
@@ -432,12 +511,14 @@ pub fn spawn_workers(
 fn push_to_queue(
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
+    tip_lamports: u64,
     pipeline: &Pipeline,
     metrics: &Metrics,
 ) {
     let item = ReadyInstruction {
         swap_ixs,
         hop_count,
+        tip_lamports,
         arrived_at: Instant::now(),
         waited_for_slot: false,
     };
@@ -477,7 +558,7 @@ pub async fn scan_all_tokens(
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
-    let min_profit_lamports = config.trading.min_profit_lamports;
+    let profit_params = ProfitParams::from_config(config);
 
     // Each (amount, token) generates two independent entries: free routes and
     // direct-only routes. They run concurrently so a slow/timing-out direct
@@ -509,7 +590,7 @@ pub async fn scan_all_tokens(
 
     let mut opps = stream::iter(all_pairs)
         .map(move |(amt, tok, direct)| async move {
-            quote_check(metis_ref, &tok, amt, direct, min_profit_lamports, met_ref, tok_met_ref)
+            quote_check(metis_ref, &tok, amt, direct, profit_params, met_ref, tok_met_ref)
                 .await
         })
         .buffer_unordered(max_concurrent);
@@ -520,13 +601,15 @@ pub async fn scan_all_tokens(
             None => continue,
         };
 
-        let on_chain_floor = pair.amount + JITO_TIP_LAMPORTS + NETWORK_FEE_LAMPORTS;
+        let on_chain_floor = pair.on_chain_floor;
+        let tip_lamports = pair.jito_tip;
         tracing::debug!(
             token = %pair.token_mint,
             amount = pair.amount,
             output = pair.output_wsol,
             quoted_edge = pair.output_wsol as i64 - pair.amount as i64,
-            floor_edge = pair.net_profit,
+            jito_tip = pair.jito_tip,
+            net_profit = pair.net_profit,
             "send_candidate"
         );
 
@@ -564,7 +647,7 @@ pub async fn scan_all_tokens(
                     metrics.ix_from_ram.fetch_add(1, Ordering::Relaxed);
                     metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
                     ctx.template_store.record_route_hit(sig);
-                    push_to_queue(patched, hop_count, pipeline, metrics);
+                    push_to_queue(patched, hop_count, tip_lamports, pipeline, metrics);
                     continue;
                 }
                 // Patching failed (no offsets discovered): fall through to Tier-2.
@@ -590,7 +673,7 @@ pub async fn scan_all_tokens(
                             metrics.ix_from_ram.fetch_add(1, Ordering::Relaxed);
                             metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
                             ctx.template_store.record_route_hit(tmpl.route_signature);
-                            push_to_queue(patched, hop_count, pipeline, metrics);
+                            push_to_queue(patched, hop_count, tip_lamports, pipeline, metrics);
                             continue;
                         }
                     }
@@ -667,6 +750,7 @@ pub async fn scan_all_tokens(
             let item = ReadyInstruction {
                 swap_ixs,
                 hop_count,
+                tip_lamports,
                 arrived_at: std::time::Instant::now(),
                 waited_for_slot: false,
             };
