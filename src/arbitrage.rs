@@ -344,7 +344,12 @@ async fn quote_check(
 
     metrics.metis_resp_ok.fetch_add(1, Ordering::Relaxed);
 
-    // On-chain revert floor must cover input + the (now dynamic) tip + fee.
+    // On-chain revert floor = the EXPENSES we must protect, nothing more:
+    //   floor = input + jito_tip + network_fee
+    // This is algebraically identical to (output_wsol - net_profit): we do NOT
+    // bake our profit into the floor. Jupiter uses positive slippage, so any
+    // output above this floor still lands and the extra stays with us — we only
+    // guard against losing money on the costs incurred.
     let on_chain_floor = amount
         .saturating_add(jito_tip)
         .saturating_add(NETWORK_FEE_LAMPORTS);
