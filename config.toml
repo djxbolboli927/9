@@ -4,7 +4,7 @@ binary_key = "5b945476-f95d-4403-a2b5-156db4ee3212"
 
 [trading]
 min_amount_sol = 0.001
-max_amount_sol = 0.05
+max_amount_sol = 0.9
 step_sol = 0.0002
 # ── Stage 1: حداقل سود ناخالص (output - input) به لمپرت ───────────────────
 # این عدد اولین فیلتر است. فقط «خروجی منهای ورودی» محاسبه می‌شود؛
@@ -35,8 +35,8 @@ urls = [
     "https://singapore.mainnet.block-engine.jito.wtf",
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
-uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
-trading_keypair = "/root/c/wallet/wallet.json"
+uuid = "b12fdfb6-f487-4de5-99d8-c601b1ab548a"
+trading_keypair = "/root/g/wallet/wallet.json"
 # انعام جیتو به‌صورت پویا و بر اساس درصد سود محاسبه می‌شود:
 #   net_before_tip = output - input - 5000 (کارمزد شبکه)
 #   انعام جیتو     = tip_min_lamports + tip_profit_percent * net_before_tip
@@ -89,7 +89,7 @@ bot_cpu_cores = [12,13,14,15,28,29,30,31]
 # منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
 # هیچ سربار متقابلی با Metis ندارد).
 enabled = false
-so_dir = "/root/c/so"
+so_dir = "/root/g/so"
 # fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
 # fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
 fail_closed = true
@@ -122,7 +122,7 @@ endpoints = [
 ]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/c/wallet/grpc.json"
+auth_keypair = "/root/g/wallet/grpc.json"
 max_bundles_per_second = 5
 
 [template_cache]
