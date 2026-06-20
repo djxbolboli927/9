@@ -52,34 +52,49 @@ impl TokenMetrics {
         self.index.get(mint).and_then(|&i| self.stats.get(i))
     }
 
-    /// Every 5 min: snapshot + reset counters → overwrite /root/c/gozaresh5.json.
-    /// Every 30 min (6 windows): accumulate → overwrite /root/c/gozaresh30.json.
-    /// Nothing is printed to the terminal.
+    /// Periodic reporter. All files live at the project root and are
+    /// overwritten in place each cycle (the previous file is updated, not
+    /// summed across files and not deleted/recreated):
+    ///
+    ///   Every  5 min → `min5`   : counts for the last 5-minute window.
+    ///   Every 30 min → `min30`  : counts accumulated over the last 30 minutes.
+    ///   Every 60 min → `min60`  : counts accumulated over the last 60 minutes.
+    ///
+    /// The 30- and 60-minute accumulators reset after each flush, so a freshly
+    /// written file never carries data from the previous one. Nothing is
+    /// printed to the terminal.
     pub fn spawn_reporter(self: &Arc<Self>) {
         let m = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             interval.tick().await; // discard the immediate first tick
 
-            // Running 30-min accumulator (same order as stats vec).
-            let mut acc: Vec<TokenSnapshot> = m
-                .stats
-                .iter()
-                .map(|s| TokenSnapshot {
-                    mint: s.mint.clone(),
-                    q_sent: 0,
-                    route_ok: 0,
-                    route_fail: 0,
-                    profitable: 0,
-                    not_profitable: 0,
-                })
-                .collect();
+            let blank_acc = || -> Vec<TokenSnapshot> {
+                m.stats
+                    .iter()
+                    .map(|s| TokenSnapshot {
+                        mint: s.mint.clone(),
+                        q_sent: 0,
+                        route_ok: 0,
+                        route_fail: 0,
+                        profitable: 0,
+                        not_profitable: 0,
+                    })
+                    .collect()
+            };
 
-            let mut windows: u32 = 0;
+            // Independent running accumulators for the 30- and 60-min reports.
+            let mut acc30: Vec<TokenSnapshot> = blank_acc();
+            let mut acc60: Vec<TokenSnapshot> = blank_acc();
+
+            // Number of 5-min windows elapsed since each accumulator was reset.
+            let mut windows30: u32 = 0;
+            let mut windows60: u32 = 0;
 
             loop {
                 interval.tick().await;
-                windows += 1;
+                windows30 += 1;
+                windows60 += 1;
 
                 let ts = now_iso();
 
@@ -97,8 +112,15 @@ impl TokenMetrics {
                     })
                     .collect();
 
-                // Add this window into the 30-min accumulator.
-                for (a, s) in acc.iter_mut().zip(snap.iter()) {
+                // Fold this window into both accumulators.
+                for (a, s) in acc30.iter_mut().zip(snap.iter()) {
+                    a.q_sent += s.q_sent;
+                    a.route_ok += s.route_ok;
+                    a.route_fail += s.route_fail;
+                    a.profitable += s.profitable;
+                    a.not_profitable += s.not_profitable;
+                }
+                for (a, s) in acc60.iter_mut().zip(snap.iter()) {
                     a.q_sent += s.q_sent;
                     a.route_ok += s.route_ok;
                     a.route_fail += s.route_fail;
@@ -107,19 +129,20 @@ impl TokenMetrics {
                 }
 
                 // Overwrite the 5-min file with this window's data.
-                write_json("/root/c/gozaresh5.json", &snap, &ts, 5);
+                write_json("min5", &snap, &ts, 5);
 
-                // Every 30 min (6 × 5-min windows): flush the summary file.
-                if windows >= 6 {
-                    write_json("/root/c/gozaresh30.json", &acc, &ts, 30);
-                    for a in acc.iter_mut() {
-                        a.q_sent = 0;
-                        a.route_ok = 0;
-                        a.route_fail = 0;
-                        a.profitable = 0;
-                        a.not_profitable = 0;
-                    }
-                    windows = 0;
+                // Every 30 min (6 × 5-min windows): flush + reset.
+                if windows30 >= 6 {
+                    write_json("min30", &acc30, &ts, 30);
+                    acc30 = blank_acc();
+                    windows30 = 0;
+                }
+
+                // Every 60 min (12 × 5-min windows): flush + reset.
+                if windows60 >= 12 {
+                    write_json("min60", &acc60, &ts, 60);
+                    acc60 = blank_acc();
+                    windows60 = 0;
                 }
             }
         });

@@ -11,6 +11,11 @@ target/
 *.tmp
 *.swp
 
+# Runtime report files (regenerated each cycle at project root)
+min5
+min30
+min60
+
 # Environment
 .env
 .env.local
